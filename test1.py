@@ -547,49 +547,24 @@ class FPN(nn.Module):
         p3_out = self.P3_conv1(c3_out) + F.upsample(p4_out, scale_factor=2)
         p2_out = self.P2_conv1(c2_out) + F.upsample(p3_out, scale_factor=2)
 
-        p5_out = self.P5_conv2(p5_out)
-        p4_out = self.P4_conv2(p4_out)
-        p3_out = self.P3_conv2(p3_out)
+        #p5_out = self.P5_conv2(p5_out)
+        #p4_out = self.P4_conv2(p4_out)
+        #p3_out = self.P3_conv2(p3_out)
         p2_out = self.P2_conv2(p2_out)
 
-
-        return [p2_out, p3_out, p4_out, p5_out]
-
+        return p2_out
 
 
-#使用预定义模型
-import torchvision.models as models
+def get_classmodel():
+    return torch.load('f:/model.pkl')    #resnet50
+classmodel=get_classmodel()
+#fixed classmodel weights
+for p in classmodel.parameters():
+    p.requires_grad = False
 
-def get_resnet101(model):
-    state_dict = torch.load(r'F:\AI\classifierModelpth\resnet101-5d3b4d8f.pth')
-    model.load_state_dict(state_dict)
-    #修改平均池化层
-    model.avgpool=nn.AdaptiveAvgPool2d(output_size=(2,2))
-    # 修改全连阶层
-    model.fc = nn.Sequential(
-        nn.Linear(2048*2*2, 1024),
-        nn.Linear(1024, 101)
-    )
-    # 全连阶层参数赋值
-    for m in model.modules():
-        if isinstance(m, nn.Linear):
-            m.weight.data.normal_(0, 0.01)
-            m.bias.data.zero_()
-        # 冻结未改变层的权重
-        elif isinstance(m,nn.Conv2d):
-            for p in m.parameters():
-                p.requires_grad=False
-        elif isinstance(m,nn.BatchNorm2d):
-            for p in m.parameters():
-                p.requires_grad=False
-    return model
-
-
-model = models.resnet101()
-resnet101=get_resnet101(model)
 
 #显示参数名和参数
-# for n,p in resnet101.named_parameters():
+# for n,p in classmodel.named_parameters():
 #     print(n,p)
 
 
@@ -716,34 +691,25 @@ def get_apn_input(fpn_feature):  #(1,512,112,112)
 #计算注意力区域的坐标和半边长
 def get_xyl(apn_input):
     '''
-    :param apn_input: 传入apn网络的输入，shape=(1,512,112,112) p2_out
+    :param apn_input: 传入apn网络的输入，shape=(N,512,112,112) p2_out
     :return: 坐标和半边长
     '''
-    N=apn_input.shape[0]
+    apn_input = apn_input.cpu()
+    N = apn_input.shape[0]
     chanels = apn_input.shape[1]
     in_size = apn_input.shape[2]
     sum_sum = torch.zeros((in_size, in_size))
-    xyl=[]
+    xyl = []
     for n in range(N):
         for i in range(chanels):
             sum_sum += apn_input[n, i, :, :]
         sum_sum = sum_sum / chanels
         # print(sum_sum)
-        # ave = (torch.sum(sum_sum) / (width * width))
-        # sum_sum[sum_sum >= ave] = 1
-        # sum_sum[sum_sum < ave] = 0
-        # for i in range(len(sum_sum)):
-        #     print('[',end='')
-        #     for j in range(len(sum_sum)):
-        #         print(sum_sum[i][j].item(),end='')
-        #         print(',',end='')
-        #     print(']')
-
         # reference macnn
         columns_max_value = torch.max(sum_sum, dim=0)[0]
         rows_max_value = torch.max(sum_sum, dim=1)[0]
         left, top, right, down = 0, 0, in_size - 1, in_size - 1
-        base = torch.max(sum_sum) * 0.65  # 设置为0.65
+        base = torch.max(sum_sum) * 0.2  # macnn设置为0.1。0.2的效果还行
         for i in range(in_size):
             if columns_max_value[i] > base:
                 left = i
@@ -766,61 +732,105 @@ def get_xyl(apn_input):
         # 设置l的范围
         if l > in_size * 3 / 8: l = in_size * 3 / 8
         if l < in_size / 12: l = in_size / 12
-        #映射到原图
-        x=x*448/in_size;y=y*448/in_size;l=l*448/in_size
+        # 映射到原图像
+        x = x * 448 / in_size
+        y = y * 448 / in_size
+        l = l * 448 / in_size
+        print('x,y,l=',x,y,l)
         xyl.append((x,y,l))
-    tensor_xyl=torch.tensor(xyl)
-    return tensor_xyl
+    tensor_xyl = torch.tensor(xyl)
+    return tensor_xyl.cuda()
 
 
+def _convertToboxes(attens):
+    """
+    attens格式转为boxes格式
+    :param attens:
+    :return:
+    """
+    boxes=[]
+    for atten in attens:
+        a=atten[0]
+        b=atten[1]
+        c=atten[2]
+        x_tl = np.maximum(0,a - c)
+        y_tl = np.maximum(0,b - c)
+        x_br = np.minimum(a + c,448)
+        y_br = np.minimum(b + c,448)
+        boxes.append((x_tl,y_tl,x_br,y_br))
+    return torch.tensor(boxes)
+
+def _overlay_boxes(img, boxes):
+    N = len(boxes)
+    colors = torch.stack([torch.tensor([2, 254, 62])] * N).tolist()
+    for box, color in zip(boxes, colors):
+        box = box.to(torch.int64)
+        top_left, bottom_right = box[:2].tolist(), box[2:].tolist()
+        img = cv2.rectangle(  # img(ndarray)
+            img, tuple(top_left), tuple(bottom_right), tuple(color), 3)
+    return img
 ##############################test###########################################
 from PIL import Image
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 #预处理输入数据
-img=Image.open('food1.jpg').convert('RGB')
-img=T.RandomCrop(448)(img)
+x=Image.open('food3.jpg').convert('RGB')
+w,h=x.size
+if h<512:
+    x = T.Resize((512,int(512 * (512 / h))))(x)
+if w<512:
+    x=T.Resize((int(512*(512/w)),512))(x)
+img=T.RandomCrop(448)(x)
 #img.show()
 rancropped_img=img
 img=T.ToTensor()(img)
 img=T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(img)
-img=img.reshape(1,3,448,448)   #torch.float32
+img=img.reshape(1,3,448,448).cuda()   #torch.float32
 # plt.imshow(img.reshape(3,448,448)[0,:,:])
 # plt.show()
 
 c1=nn.Sequential(
-    resnet101.conv1,
-    resnet101.bn1,
-    resnet101.relu,
-    resnet101.maxpool
+    classmodel.conv1,
+    classmodel.bn1,
+    classmodel.relu,
+    classmodel.maxpool
 )
-c2=resnet101.layer1
-c3=resnet101.layer2
-c4=resnet101.layer3
-c5=resnet101.layer4
-resnet101_fpn=FPN(c1,c2,c3,c4,c5,512)
-[p2_out, p3_out, p4_out, p5_out]=resnet101_fpn(img)
+c2=classmodel.layer1
+c3=classmodel.layer2
+c4=classmodel.layer3
+c5=classmodel.layer4
+fpn=FPN(c1,c2,c3,c4,c5,512)
+fpn=fpn.cuda()
+p2_out=fpn(img)
 
 #print(p_list[0].shape) #[1, 512, 112, 112]
 # print(p_list[1].shape) #[1, 512, 56, 56]
 # print(p_list[2].shape) #[1, 512, 28, 28]
 # print(p_list[3].shape) #[1, 512, 14, 14]
 
-# plt.imshow(p2_out.reshape(512,112,112).data.numpy()[0,:,:])
+plt.imshow(p2_out.cpu().reshape(512,112,112).data.numpy()[0,:,:])
+plt.show()
+
+#test get_xyl
+xyl=get_xyl(p2_out).cpu()
+xyl=_convertToboxes(xyl)
+img = _overlay_boxes(np.array(rancropped_img), xyl)
+plt.imshow(img)
+plt.show()
+
+#越界检验
+#box=(np.maximum(0,x-l),np.maximum(0,y-l),np.minimum(448,x+l),np.minimum(448,y+l))
+#显示被裁剪的区域
+# roi=rancropped_img.crop(box)
+# plt.imshow(roi),plt.axis('off')
 # plt.show()
+#显示448图像及被裁剪区域的框
 
-#test get_xyl
-#x,y,l=get_xyl(p2_out)
-# #越界检验
-# box=(np.maximum(0,x-l),np.maximum(0,y-l),np.minimum(448,x+l),np.minimum(448,y+l))
-# #显示被裁剪的区域
-# # roi=cropped_img.crop(box)
-# # plt.imshow(roi),plt.axis('off')
-# # plt.show()
 
-#test get_xyl
-# tensor_xyl=get_xyl(p2_out)
-# print(tensor_xyl)
+
+
+
+
 
 #test crop_amplificate
 #crop_amplificate(rancropped_img,x,y,l)
